@@ -1,0 +1,14 @@
+*.py[oc]
+__pycache__/
+.pytest_cache/
+*.egg-info/
+/*venv/
+/dist/
+/build/
+/wheels/
+
+.idea/
+.vscode/
+.zed/
+
+*~
