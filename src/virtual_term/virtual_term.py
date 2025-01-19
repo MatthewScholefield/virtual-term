@@ -1,7 +1,6 @@
 import asyncio
 import os
 from os.path import basename
-import subprocess
 from contextlib import suppress
 from typing import AsyncGenerator, List, Tuple, Optional
 import uuid
@@ -59,12 +58,12 @@ class VirtualTerm:
             f'{cd_prefix}{prompt_customization}; echo "printed:"{prefix_indicator}'
         )
 
-        pty_process._run_screen(
+        await pty_process._run_screen(
             f'-L -Logfile {pty_process.log_file.as_posix()} -dm {shell_command}'
         )
-        pty_process._run_screen('-X logfile flush 0')
-        pty_process.setwinsize(*dimensions)
-        pty_process.write(initial_command + '\n')
+        await pty_process._run_screen('-X logfile flush 0')
+        await pty_process.setwinsize(*dimensions)
+        await pty_process.write(initial_command + '\n')
 
         # Wait for us to see initial_command in the log file
         async for _ in pty_process.read_command_result_stream(1):
@@ -72,7 +71,12 @@ class VirtualTerm:
         prefix = pty_process._fd.read(10240)
         # Find last occurrence of prefix_indicator in the log file
         search_string = 'printed:' + prefix_indicator
-        index = prefix.rfind(search_string.encode())
+        index = -1
+        for _ in range(50):
+            index = prefix.rfind(search_string.encode())
+            if index == -1:
+                await asyncio.sleep(0.1)
+                prefix += pty_process._fd.read(10240)
         if index == -1:
             raise VirtualTermError(f'Prefix indicator not found in log file: {prefix}')
         index += len(search_string)
@@ -111,29 +115,7 @@ class VirtualTerm:
         self.read_new_output()
         self.read_new_command_results()
 
-        self.write(command + '\r')
-        return await self.wait_for_last_command(update_timeout, global_timeout)
-
-    async def run_command_reliable(
-        self,
-        command: str,
-        update_timeout: Optional[float] = None,
-        global_timeout: Optional[float] = None,
-    ) -> CommandResult:
-        """
-        Run a command in the terminal session, waiting for the command to finish and returning the output.
-        Note that the output will likely contain the command itself depending on the shell.
-
-        Args:
-            command: The command to run.
-            update_timeout: The maximum time to wait for new output before raising a PtyTimeoutError.
-            global_timeout: The maximum total time to wait for new output before raising a PtyTimeoutError.
-        """
-        # Clear the buffer
-        self.read_new_output()
-        self.read_new_command_results()
-
-        self.write(command + '\r')
+        await self.write(command + '\r')
         return await self.wait_for_last_command(update_timeout, global_timeout)
 
     async def read_output_stream(
@@ -215,43 +197,37 @@ class VirtualTerm:
                 break
         return results
 
-    def write(self, s: str):
+    async def write(self, s: str):
         """Send input to the screen session."""
         escaped_input = shlex.quote(s)
-        self._run_screen(f'-p 0 -X stuff {escaped_input}')
+        await self._run_screen(f'-p 0 -X stuff {escaped_input}')
 
-    def write_literal(self, s: str):
+    async def write_literal(self, s: str):
         """Send content to the screen, escaping caret symbols so they aren't parsed as control codes"""
-        self.write(s.replace('^', r'\^'))
+        await self.write(s.replace('^', r'\^'))
 
-    def terminate(self):
+    async def terminate(self):
         """Terminate the screen session."""
         with suppress(TerminalDeadError):
-            self._run_screen('-X kill')
+            await self._run_screen('-X kill')
         self._fd.close()
         self._commands_fd.close()
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.terminate()
-
-    def close(self):
+    async def close(self):
         """Terminate the screen session."""
         with suppress(TerminalDeadError):
-            self._run_screen('-X quit')
+            await self._run_screen('-X quit')
         self._fd.close()
         self._commands_fd.close()
 
-    def wait(self):
+    async def wait(self):
         """Wait for the screen session to terminate."""
-        while self.isalive():
-            time.sleep(0.5)
+        while await self.isalive():
+            await asyncio.sleep(0.5)
 
-    def setwinsize(self, rows, cols):
+    async def setwinsize(self, rows, cols):
         """Set the screen session window size."""
-        self._run_screen(f'-p 0 -X height {rows} {cols}')
+        await self._run_screen(f'-p 0 -X height {rows} {cols}')
         self.size_file.write_text(f'{rows} {cols}')
 
     def getwinsize(self) -> Tuple[int, int]:
@@ -259,18 +235,18 @@ class VirtualTerm:
         rows_str, cols_str = self.size_file.read_text().split()
         return int(rows_str), int(cols_str)
 
-    def isalive(self):
+    async def isalive(self):
         """Check if the screen session is still active."""
-        result = subprocess.run(
+        result = await asyncio.create_subprocess_shell(
             f'screen -list {self.screen_name}',
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        stdout, stderr = await result.communicate()
         if result.returncode != 0:
             return False
         matched_lines = [
-            x for x in result.stdout.splitlines() if self.screen_name.encode() in x
+            x for x in stdout.splitlines() if self.screen_name.encode() in x
         ]
         if len(matched_lines) != 1:
             return False
@@ -278,28 +254,29 @@ class VirtualTerm:
             return False
         return True
 
-    def ctrl_c(self):
+    async def ctrl_c(self):
         """Send a Ctrl+C to the screen session."""
-        self._run_screen('-p 0 -X stuff ^C')
+        await self._run_screen('-p 0 -X stuff ^C')
 
-    def kill(self):
+    async def kill(self):
         """Kill the current screen session."""
-        self._run_screen('-X kill')
+        await self._run_screen('-X kill')
 
-    def _run_screen(self, cmd: str):
-        result = subprocess.run(
+    async def _run_screen(self, cmd: str):
+        result = await asyncio.create_subprocess_shell(
             f'screen -S {self.screen_name} {cmd}',
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            executable='/bin/bash',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        stdout, stderr = await result.communicate()
         if result.returncode != 0:
-            if b'No screen session found' in result.stdout:
-                if b'Dead' in result.stdout:
-                    self._run_screen('-wipe')
+            if b'No screen session found' in stdout:
+                if b'Dead' in stdout:
+                    await self._run_screen('-wipe')
                 raise TerminalDeadError()
             raise VirtualTermError(
-                f'Unexpected error: {result.stdout.decode()} {result.stderr.decode()}'
+                f'Unexpected error: {stdout.decode()} {stderr.decode()}'
             )
 
 
