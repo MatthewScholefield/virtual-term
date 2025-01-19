@@ -43,9 +43,10 @@ class VirtualTerm:
         cls,
         cwd: Path | None = None,
         dimensions=(24, 80),
+        shell: str | None = None,
     ):
         pty_process = cls(id=uuid.uuid4().hex)
-        shell_command = shlex.join([os.environ.get('SHELL', '/bin/bash')])
+        shell_command = shell or os.environ.get('SHELL', '/bin/bash')
         cd_prefix = f'cd {shlex.quote(str(cwd))}; ' if cwd else ''
 
         # Include an evaluated command that appends the last status code to a file we watch for changes
@@ -62,35 +63,58 @@ class VirtualTerm:
             f'-L -Logfile {pty_process.log_file.as_posix()} -dm {shell_command}'
         )
         pty_process._run_screen('-X logfile flush 0')
-        pty_process.write(initial_command + '\n')
         pty_process.setwinsize(*dimensions)
+        pty_process.write(initial_command + '\n')
 
         # Wait for us to see initial_command in the log file
         async for _ in pty_process.read_command_result_stream(1):
             pass
         prefix = pty_process._fd.read(10240)
         # Find last occurrence of prefix_indicator in the log file
-        index = prefix.rfind(('printed:' + prefix_indicator).encode())
+        search_string = 'printed:' + prefix_indicator
+        index = prefix.rfind(search_string.encode())
         if index == -1:
             raise VirtualTermError(f'Prefix indicator not found in log file: {prefix}')
-        index += len(prefix_indicator)
+        index += len(search_string)
         while index < len(prefix) and prefix[index] in b'\r\n':
             index += 1
         pty_process._fd.seek(index, os.SEEK_SET)
         pty_process._commands_fd.seek(0, os.SEEK_END)
-        if os.environ.get('RUNNING_TESTS'):
+        if os.environ.get('TEST_VALIDATE_LAST_COMMAND'):
             try:
-                result = await pty_process.wait_for_last_command(global_timeout=0.2)
+                result = await pty_process.wait_for_last_command(global_timeout=1.0)
             except CommandTimeoutError:
                 pass
             else:
                 raise VirtualTermError(
-                    f'Unexpected output after startup ({result.return_code}): {result.output}'
+                    f'Unexpected redraw after startup ({pty_process.log_file}) ({result.return_code}): {result.output!r}'
                 )
 
         return pty_process
 
     async def run_command(
+        self,
+        command: str,
+        update_timeout: Optional[float] = None,
+        global_timeout: Optional[float] = None,
+    ) -> CommandResult:
+        """
+        Run a command in the terminal session, waiting for the command to finish and returning the output.
+        Note that the output will likely contain the command itself depending on the shell.
+
+        Args:
+            command: The command to run.
+            update_timeout: The maximum time to wait for new output before raising a PtyTimeoutError.
+            global_timeout: The maximum total time to wait for new output before raising a PtyTimeoutError.
+        """
+        # Clear the buffer
+        self.read_new_output()
+        self.read_new_command_results()
+
+        self.write(command + '\r')
+        return await self.wait_for_last_command(update_timeout, global_timeout)
+
+    async def run_command_reliable(
         self,
         command: str,
         update_timeout: Optional[float] = None,
@@ -298,7 +322,7 @@ async def _watch_for_file_updates(
             import math
 
             try:
-                res = await asyncio.wait_for(
+                await asyncio.wait_for(
                     inotify.get(), timeout if math.isfinite(timeout) else None
                 )
             except asyncio.TimeoutError:

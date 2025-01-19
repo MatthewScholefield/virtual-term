@@ -1,6 +1,6 @@
 [project]
 name = "virtual-term"
-version = "0.1.0"
+version = "0.1.1"
 description = "A simple Python library for creating and interacting with virtual terminals"
 authors = [
     { name = "Matthew D. Scholefield", email = "matthew331199@gmail.com" },

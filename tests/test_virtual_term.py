@@ -10,8 +10,7 @@ from virtual_term import (
 
 @pytest.fixture
 async def term() -> AsyncGenerator[VirtualTerm, None]:
-    term = await VirtualTerm.spawn()
-    # await asyncio.sleep(3)
+    term = await VirtualTerm.spawn(shell='/bin/bash')
     yield term
     term.terminate()
 
@@ -24,9 +23,10 @@ async def test_spawn_terminal(term: VirtualTerm) -> None:
 @pytest.mark.asyncio
 async def test_spawn_validate_last_command():
     import os
+
     os.environ['TEST_VALIDATE_LAST_COMMAND'] = '1'
     try:
-        term = await VirtualTerm.spawn()
+        term = await VirtualTerm.spawn(shell='/bin/bash')
         term.terminate()
     finally:
         del os.environ['TEST_VALIDATE_LAST_COMMAND']
