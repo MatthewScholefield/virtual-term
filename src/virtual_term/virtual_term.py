@@ -54,8 +54,9 @@ class VirtualTerm:
         prompt_customization = f'{prompt_var}="\\\\$(echo \\\\$? >> {command_outputs_file})\\${prompt_var}"'
 
         prefix_indicator = f'prefix:{pty_process.id}'
+        # Add a leading space to avoid the command being saved in the history if the user has that enabled
         initial_command = (
-            f'{cd_prefix}{prompt_customization}; echo "printed:"{prefix_indicator}'
+            f' {cd_prefix}{prompt_customization}; echo "printed:"{prefix_indicator}'
         )
 
         await pty_process._run_screen(
