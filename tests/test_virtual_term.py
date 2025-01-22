@@ -37,9 +37,11 @@ async def test_spawn_validate_last_command():
 
 @pytest.mark.asyncio
 async def test_run_command(term: VirtualTerm) -> None:
-    result: CommandResult = await term.run_command('echo Hello, World!')
-    assert 'Hello, World!' in result.output
+    result: CommandResult = await term.run_command('echo Hello, World! ;')
+    assert b'Hello, World!' in result.output
     assert result.return_code == 0
+    print(result.output)
+    assert False
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class CommandResult:
-    output: str
+    output: bytes
     return_code: int
 
 
