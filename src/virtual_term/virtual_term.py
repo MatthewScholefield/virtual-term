@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 from contextlib import suppress
 from typing import AsyncGenerator, Awaitable, Callable, List, Optional, Tuple
+import select
 
 from asyncinotify import Inotify, Mask
 
@@ -56,9 +57,8 @@ class AsyncPtyProcess:
 
         def reader_ready():
             try:
-                print('READER READY...')
                 data = os.read(fd, 1024)
-                print('GET ', len(data))
+                print('GGGGET ', len(data), data)
                 if data:
                     stream_reader.feed_data(data)
                 else:
@@ -70,17 +70,10 @@ class AsyncPtyProcess:
 
         try:
             while True:
-                was_set = self.flush_event.is_set()
-                if not was_set and stream_reader.at_eof():
-                    self.flush_event.set()
-                print('Check', was_set, stream_reader.at_eof())
                 chunk = await stream_reader.read(1024)
-                print('Len:', len(chunk))
                 if not chunk:
                     break
                 yield chunk
-                if not was_set:
-                    self.flush_event.set()
         finally:
             loop.remove_reader(fd)
 
@@ -228,7 +221,6 @@ class VirtualTerm:
 
         if not prefix_found:
             raise VirtualTermError(f"Prefix indicator not found in PTY output.")
-        print('SAW PREFIX:', instance.log_buffer)
 
         # Mark that we've handled everything up to and including the prefix
         idx = instance.log_buffer.rfind(f"printed:{prefix_indicator}".encode())
@@ -246,13 +238,10 @@ class VirtualTerm:
         """
         if not self.pty_process:
             return
-        try:
-            async for chunk in self.pty_process.read_output():
-                self.log_buffer.extend(chunk)
-                self.new_content_event.set()
-        except Exception as e:
-            raise
-            print('Exception capturing pty output:', repr(e))
+        async for chunk in self.pty_process.read_output():
+            self.log_buffer.extend(chunk)
+            print('RECEIVE', len(chunk), chunk)
+            self.new_content_event.set()
         self.is_alive = False
         self.new_content_event.set()
 
@@ -319,8 +308,16 @@ class VirtualTerm:
         async for return_code in self.read_command_result_stream(
             limit=1, update_timeout=update_timeout, global_timeout=global_timeout
         ):
-            self.pty_process.flush_event.clear()
-            await self.pty_process.flush_event.wait()
+            fd = self.pty_process.fd
+            print('CCCCHECK')
+            while True:
+                # Check if fd has data using select nonblocking
+                r, _, _ = select.select([fd], [], [], 0)
+                if not r:
+                    break
+                print('HHHHAS DATA')
+                await asyncio.sleep(0.001)
+            print('DDDONE, now reading')
             output = self.read_new_output()
             return CommandResult(output, return_code)
         raise RuntimeError("No return code found for the last command.")
@@ -358,7 +355,7 @@ class VirtualTerm:
             try:
                 data = self._commands_fd.readline()
             except ValueError as e:
-                if "read of closed file" in str(e):
+                if "of closed file" in str(e):
                     raise TerminalDeadError()
                 raise
             if not data:

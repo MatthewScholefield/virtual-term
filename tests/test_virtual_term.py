@@ -40,8 +40,6 @@ async def test_run_command(term: VirtualTerm) -> None:
     result: CommandResult = await term.run_command('echo Hello, World! ;')
     assert b'Hello, World!' in result.output
     assert result.return_code == 0
-    print(result.output)
-    assert False
 
 
 @pytest.mark.asyncio
@@ -76,7 +74,7 @@ async def test_command_timeout(term: VirtualTerm) -> None:
     assert result.return_code == 130
     result: CommandResult = await term.run_command('echo $((11 + 22))')
     assert result.return_code == 0
-    assert '33' in result.output
+    assert b'33' in result.output
 
 
 @pytest.mark.asyncio
