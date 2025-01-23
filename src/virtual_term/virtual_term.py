@@ -34,6 +34,7 @@ class AsyncPtyProcess:
     async def spawn(self):
         self.child_pid, self.fd = pty.fork()
         if self.child_pid == 0:
+            # Disable buffering of stdin and stdout
             # In the child process; launch command through exec
             os.execvp(self.cmd[0], self.cmd)
             raise SystemExit(0)
@@ -60,7 +61,15 @@ class AsyncPtyProcess:
         """Write data to the PTY."""
         if not self.fd:
             raise TerminalDeadError('PTY file descriptor not initialized.')
-        await asyncio.get_event_loop().run_in_executor(None, os.write, self.fd, data)
+
+        # This is technically a blocking operation, but doing it like this improves performance.
+        # There is noticeable latency when spawning a task in the executor
+        if len(data) < 512:
+            os.write(self.fd, data)
+        else:
+            await asyncio.get_event_loop().run_in_executor(
+                None, os.write, self.fd, data
+            )
 
     def resize(self, rows: int, cols: int):
         """Resize the PTY terminal."""
