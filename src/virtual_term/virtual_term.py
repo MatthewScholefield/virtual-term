@@ -1,284 +1,89 @@
 import asyncio
 import os
-from os.path import basename
-from contextlib import suppress
-from typing import AsyncGenerator, List, Tuple, Optional
-import uuid
+import pty
 import shlex
 import time
+import uuid
 from pathlib import Path
+from contextlib import suppress
+from typing import AsyncGenerator, List, Optional, Tuple
+import select
 
 from asyncinotify import Inotify, Mask
 
+# If you have your own definitions for these, keep them. Otherwise, you can stub them out or adjust as needed.
 from .types import (
     CommandResult,
-    VirtualTermError,
     TerminalDeadError,
     CommandTimeoutError,
 )
 
 
-class VirtualTerm:
-    screen_prefix = 'screen_pty_term_'
+class AsyncPtyProcess:
+    """
+    Basic class for spawning and interacting with a PTY process asynchronously.
+    """
 
-    def __init__(self, id: str):
-        self.screen_name = self.screen_prefix + id
-        from tempfile import gettempdir
+    def __init__(self, cmd: List[str]):
+        self.cmd = cmd
+        self.reading_more_event = asyncio.Event()
+        self.reader: Optional[asyncio.streams.StreamReader] = None
+        self.child_pid: Optional[int] = None
+        self.fd: Optional[int] = None
 
-        self.log_file = Path(gettempdir()) / f'{self.screen_name}.log'
-        self.size_file = Path(gettempdir()) / f'{self.screen_name}.size.txt'
-        self.command_outputs_file = (
-            Path(gettempdir()) / f'{self.screen_name}.outputs.txt'
-        )
-        self.log_file.touch()
-        self.command_outputs_file.touch()
-        self._fd = self.log_file.open('rb')
-        self._commands_fd = self.command_outputs_file.open('rb')
-        self.id = id
-        self.log_file_offset = 0
+    async def spawn(self):
+        self.child_pid, self.fd = pty.fork()
+        if self.child_pid == 0:
+            # In the child process; launch command through exec
+            os.execvp(self.cmd[0], self.cmd)
+            raise SystemExit(0)
+        self.reader = self._create_stream_reader(self.fd)
 
-    @classmethod
-    async def spawn(
-        cls,
-        cwd: Path | None = None,
-        dimensions=(24, 80),
-        shell: str | None = None,
-    ):
-        pty_process = cls(id=uuid.uuid4().hex)
-        shell_command = shell or os.environ.get('SHELL', '/bin/bash')
-        cd_prefix = f'cd {shlex.quote(str(cwd))}; ' if cwd else ''
+    def _create_stream_reader(self, fd: int) -> asyncio.streams.StreamReader:
+        stream_reader = asyncio.StreamReader()
 
-        # Include an evaluated command that appends the last status code to a file we watch for changes
-        prompt_var = {'bash': 'PS1', 'zsh': 'PROMPT'}[basename(shell_command)]
-        command_outputs_file = str(pty_process.command_outputs_file)
-        prompt_customization = f'{prompt_var}="\\\\$(echo \\\\$? >> {command_outputs_file})\\${prompt_var}"'
-
-        prefix_indicator = f'prefix:{pty_process.id}'
-        # Add a leading space to avoid the command being saved in the history if the user has that enabled
-        initial_command = (
-            f' {cd_prefix}{prompt_customization}; echo "printed:"{prefix_indicator}'
-        )
-
-        await pty_process._run_screen(
-            f'-L -Logfile {pty_process.log_file.as_posix()} -dm {shell_command}'
-        )
-        await pty_process._run_screen('-X logfile flush 0')
-        await pty_process.setwinsize(*dimensions)
-        await pty_process.write(initial_command + '\n')
-
-        # Wait for us to see initial_command in the log file
-        async for _ in pty_process.read_command_result_stream(1):
-            pass
-        prefix = pty_process._fd.read(10240)
-        # Find last occurrence of prefix_indicator in the log file
-        search_string = 'printed:' + prefix_indicator
-        index = -1
-        for _ in range(50):
-            index = prefix.rfind(search_string.encode())
-            if index == -1:
-                await asyncio.sleep(0.1)
-                prefix += pty_process._fd.read(10240)
-        if index == -1:
-            raise VirtualTermError(f'Prefix indicator not found in log file: {prefix}')
-        index += len(search_string)
-        while index < len(prefix) and prefix[index] in b'\r\n':
-            index += 1
-        pty_process._fd.seek(index, os.SEEK_SET)
-        pty_process._commands_fd.seek(0, os.SEEK_END)
-        if os.environ.get('TEST_VALIDATE_LAST_COMMAND'):
+        def reader_ready():
             try:
-                result = await pty_process.wait_for_last_command(global_timeout=1.0)
-            except CommandTimeoutError:
-                pass
-            else:
-                raise VirtualTermError(
-                    f'Unexpected redraw after startup ({pty_process.log_file}) ({result.return_code}): {result.output!r}'
-                )
-
-        return pty_process
-
-    async def run_command(
-        self,
-        command: str,
-        update_timeout: Optional[float] = None,
-        global_timeout: Optional[float] = None,
-    ) -> CommandResult:
-        """
-        Run a command in the terminal session, waiting for the command to finish and returning the output.
-        Note that the output will likely contain the command itself depending on the shell.
-
-        Args:
-            command: The command to run.
-            update_timeout: The maximum time to wait for new output before raising a PtyTimeoutError.
-            global_timeout: The maximum total time to wait for new output before raising a PtyTimeoutError.
-        """
-        # Clear the buffer
-        self.read_new_output()
-        self.read_new_command_results()
-
-        await self.write(command + '\r')
-        return await self.wait_for_last_command(update_timeout, global_timeout)
-
-    async def read_output_stream(
-        self, size: Optional[int] = None
-    ) -> AsyncGenerator[bytes, None]:
-        """
-        A generator that yields the output of the terminal session chunk by chunk.
-        This should never be called concurrently since it reads from the same file descriptor.
-        """
-        async for _ in _watch_for_file_updates(self.log_file):
-            data = self.read_new_output(size)
-            if data:
-                yield data
-
-    async def wait_for_last_command(
-        self,
-        update_timeout: Optional[float] = None,
-        global_timeout: Optional[float] = None,
-    ) -> CommandResult:
-        async for return_code in self.read_command_result_stream(
-            1, update_timeout, global_timeout
-        ):
-            output = self.read_new_output().decode()
-            return CommandResult(output, return_code)
-        raise RuntimeError(
-            'read_command_result_stream should never return without yielding a value'
-        )
-
-    async def read_command_result_stream(
-        self,
-        limit: int | None = None,
-        update_timeout: Optional[float] = None,
-        global_timeout: Optional[float] = None,
-    ) -> AsyncGenerator[int, None]:
-        """
-        A generator that yields the return code of a command executed in the terminal session.
-        This should never be called concurrently since it reads from the same file descriptor.
-
-        Args:
-            limit: The maximum number of return codes to yield.
-            output_timeout: The maximum time to wait for new output before raising a PtyTimeoutError.
-            global_timeout: The maximum total time to wait for new output before stopping the generator.
-        """
-        count = 0
-
-        async for _ in _watch_for_file_updates(
-            self.command_outputs_file, update_timeout, global_timeout
-        ):
-            for command_result in self.read_new_command_results(
-                limit - count if limit else None
-            ):
-                yield command_result
-                count += 1
-                if limit and count >= limit:
+                data = os.read(fd, 1024)
+                self.reading_more_event.set()
+                if data:
+                    stream_reader.feed_data(data)
                     return
-        raise CommandTimeoutError()
+            except OSError:
+                pass
+            stream_reader.feed_eof()
 
-    def read_new_output(self, size: Optional[int] = None) -> bytes:
-        try:
-            return self._fd.read(size)
-        except ValueError as e:
-            if 'read of closed file' in str(e):
-                raise TerminalDeadError()
-            raise
+        asyncio.get_event_loop().add_reader(fd, reader_ready)
+        return stream_reader
 
-    def read_new_command_results(self, limit: Optional[int] = None) -> List[int]:
-        results = []
-        while True:
-            try:
-                data = self._commands_fd.readline()
-            except ValueError as e:
-                if 'read of closed file' in str(e):
-                    raise TerminalDeadError()
-                raise
-            if not data:
-                break
-            results.append(int(data))
-            if limit and len(results) >= limit:
-                break
-        return results
+    async def write(self, data: bytes):
+        """Write data to the PTY."""
+        if not self.fd:
+            raise TerminalDeadError('PTY file descriptor not initialized.')
+        await asyncio.get_event_loop().run_in_executor(None, os.write, self.fd, data)
 
-    async def write(self, s: str):
-        """Send input to the screen session."""
-        escaped_input = shlex.quote(s)
-        await self._run_screen(f'-p 0 -X stuff {escaped_input}')
+    def resize(self, rows: int, cols: int):
+        """Resize the PTY terminal."""
+        if not self.fd:
+            raise TerminalDeadError('PTY file descriptor not initialized.')
+        import fcntl
+        import termios
+        import struct
 
-    async def write_literal(self, s: str):
-        """Send content to the screen, escaping caret symbols so they aren't parsed as control codes"""
-        await self.write(s.replace('^', r'\^'))
+        winsize = struct.pack('HHHH', rows, cols, 0, 0)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
 
-    async def terminate(self):
-        """Terminate the screen session."""
-        with suppress(TerminalDeadError):
-            await self._run_screen('-X kill')
-        self._fd.close()
-        self._commands_fd.close()
-
-    async def close(self):
-        """Terminate the screen session."""
-        with suppress(TerminalDeadError):
-            await self._run_screen('-X quit')
-        self._fd.close()
-        self._commands_fd.close()
-
-    async def wait(self):
-        """Wait for the screen session to terminate."""
-        while await self.isalive():
-            await asyncio.sleep(0.5)
-
-    async def setwinsize(self, rows, cols):
-        """Set the screen session window size."""
-        await self._run_screen(f'-p 0 -X height {rows} {cols}')
-        self.size_file.write_text(f'{rows} {cols}')
-
-    def getwinsize(self) -> Tuple[int, int]:
-        """Get the screen session window size."""
-        rows_str, cols_str = self.size_file.read_text().split()
-        return int(rows_str), int(cols_str)
-
-    async def isalive(self):
-        """Check if the screen session is still active."""
-        result = await asyncio.create_subprocess_shell(
-            f'screen -list {self.screen_name}',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await result.communicate()
-        if result.returncode != 0:
-            return False
-        matched_lines = [
-            x for x in stdout.splitlines() if self.screen_name.encode() in x
-        ]
-        if len(matched_lines) != 1:
-            return False
-        if b'(Dead ???)' in matched_lines[0]:
-            return False
-        return True
-
-    async def ctrl_c(self):
-        """Send a Ctrl+C to the screen session."""
-        await self._run_screen('-p 0 -X stuff ^C')
-
-    async def kill(self):
-        """Kill the current screen session."""
-        await self._run_screen('-X kill')
-
-    async def _run_screen(self, cmd: str):
-        result = await asyncio.create_subprocess_shell(
-            f'screen -S {self.screen_name} {cmd}',
-            executable='/bin/bash',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await result.communicate()
-        if result.returncode != 0:
-            if b'No screen session found' in stdout:
-                if b'Dead' in stdout:
-                    await self._run_screen('-wipe')
-                raise TerminalDeadError()
-            raise VirtualTermError(
-                f'Unexpected error: {stdout.decode()} {stderr.decode()}'
-            )
+    async def stop(self):
+        """Stop the PTY process and clean up."""
+        if self.reader:
+            self.reader.feed_eof()
+        if self.fd:
+            asyncio.get_event_loop().remove_reader(self.fd)
+            os.close(self.fd)
+        if self.child_pid:
+            with suppress(ProcessLookupError):
+                os.kill(self.child_pid, 9)  # Forcefully terminate the child process
+        self.fd = self.reader = self.child_pid = None
 
 
 async def _watch_for_file_updates(
@@ -286,18 +91,26 @@ async def _watch_for_file_updates(
     update_timeout: Optional[float] = None,
     global_timeout: Optional[float] = None,
 ) -> AsyncGenerator[None, None]:
+    """
+    Watches a file for updates using inotify and yields whenever changes are detected.
+    Times out if no updates are detected within update_timeout or the overall global_timeout.
+    """
     start_time = time.monotonic()
 
     with Inotify() as inotify:
         inotify.add_watch(file_path, Mask.CREATE | Mask.MODIFY)
 
-        yield
+        yield  # Yield once initially
         while True:
             timeout = update_timeout or float('inf')
             if global_timeout:
                 time_remaining = global_timeout - (time.monotonic() - start_time)
                 timeout = min(timeout, time_remaining)
+
             import math
+
+            if timeout <= 0:
+                return
 
             try:
                 await asyncio.wait_for(
@@ -306,3 +119,269 @@ async def _watch_for_file_updates(
             except asyncio.TimeoutError:
                 return
             yield
+
+
+class VirtualTerm:
+    def __init__(self, id_str: str, dimensions: Tuple[int, int]):
+        self.id = id_str
+
+        from tempfile import gettempdir
+
+        self.dimensions = dimensions  # Terminal dimensions (rows, cols)
+        self.is_alive = False
+
+        # For storing the child's exit codes
+        tmp_dir = Path(gettempdir())
+        self.command_outputs_file = tmp_dir / f'pty_term_{self.id}.outputs.txt'
+        self.command_outputs_file.touch()
+        self._commands_fd = self.command_outputs_file.open('rb')
+
+        self.pty_process: Optional[AsyncPtyProcess] = None
+
+    @classmethod
+    async def spawn(
+        cls,
+        cwd: Path | None = None,
+        dimensions=(24, 80),
+        shell: str | None = None,
+    ):
+        """
+        Spawn a new VirtualTerm instance, setting up a shell with a prompt that
+        appends exit codes to the command_outputs_file.
+        """
+        instance = cls(id_str=uuid.uuid4().hex, dimensions=dimensions)
+
+        shell_command = shell or os.environ.get('SHELL', '/bin/bash')
+        # Retrieve the shell-specific prompt variable
+        prompt_var = {'bash': 'PS1', 'zsh': 'PROMPT'}.get(
+            os.path.basename(shell_command), 'PS1'
+        )
+
+        cd_prefix = f'cd {shlex.quote(str(cwd))}; ' if cwd else ''
+        command_outputs_file = str(instance.command_outputs_file)
+
+        # Modify the prompt so that every command's exit code is appended to command_outputs_file
+        prompt_customization = (
+            f'{prompt_var}="\\$(echo \\$? >> {command_outputs_file})${prompt_var}"'
+        )
+
+        # We'll place a marker in the output to know when the shell is ready.
+        prefix_indicator_suffix = f'prefix:{instance.id}'
+        initial_command = (
+            f' {cd_prefix}{prompt_customization}; '
+            f'printf "printed:""{prefix_indicator_suffix}\\n"'
+        )
+        prefix_indicator = f'printed:{prefix_indicator_suffix}\r\n'.encode()
+
+        instance.pty_process = AsyncPtyProcess([shell_command])
+        instance.is_alive = True
+        await instance.pty_process.spawn()
+        instance.pty_process.resize(dimensions[0], dimensions[1])
+        await instance.pty_process.write(initial_command.encode() + b'\n')
+
+        assert instance.pty_process.reader
+        await instance.pty_process.reader.readuntil(prefix_indicator)
+        return instance
+
+    async def read_new_output(self, size: Optional[int] = None) -> bytes:
+        """
+        Returns new output from the PTY that we haven't returned before.
+        """
+        if not self.pty_process or not self.pty_process.reader:
+            raise TerminalDeadError('PTY process is not active.')
+
+        new_bytes = bytearray()
+        while True:
+            try:
+                new_chunk = await asyncio.wait_for(
+                    self.pty_process.reader.read(1024), timeout=0.001
+                )
+            except asyncio.TimeoutError:
+                new_chunk = b''
+            if not new_chunk:
+                break
+            new_bytes.extend(new_chunk)
+        return bytes(new_bytes)
+
+    async def read_output_stream(
+        self, size: Optional[int] = None
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        A generator that yields new PTY output in chunks.
+        You should not call this concurrently with read_new_output().
+        """
+        if not self.pty_process or not self.pty_process.reader:
+            raise TerminalDeadError('PTY process is not active.')
+        while self.is_alive:
+            yield await self.pty_process.reader.read(1024)
+
+    async def run_command(
+        self,
+        command: bytes,
+        update_timeout: Optional[float] = None,
+        global_timeout: Optional[float] = None,
+    ) -> CommandResult:
+        """
+        Run a command in the terminal session, waiting for the command to finish and returning the output.
+        """
+        # Clear any outstanding buffer data & command results
+        await self.read_new_output()
+
+        self.read_new_command_results()
+
+        if not self.pty_process:
+            raise TerminalDeadError('PTY process is not active.')
+
+        await self.write(command + b'\r')
+        return await self.wait_for_last_command(update_timeout, global_timeout)
+
+    async def wait_for_last_command(
+        self,
+        update_timeout: Optional[float] = None,
+        global_timeout: Optional[float] = None,
+    ) -> CommandResult:
+        """
+        Wait for the exit code from the last command, once the shell writes to self.command_outputs_file.
+        Then return the output and the code as a CommandResult.
+        """
+        if not self.pty_process:
+            raise TerminalDeadError('PTY process is not active.')
+        async for return_code in self.read_command_result_stream(
+            limit=1, update_timeout=update_timeout, global_timeout=global_timeout
+        ):
+            fd = self.pty_process.fd
+            while True:
+                self.pty_process.reading_more_event.clear()
+                # Check if fd has data using select nonblocking
+                r, _, _ = select.select([fd], [], [], 0)
+                if not r:
+                    break
+                await self.pty_process.reading_more_event.wait()
+            output = await self.read_new_output()
+            return CommandResult(output, return_code)
+        raise RuntimeError('No return code found for the last command.')
+
+    async def read_command_result_stream(
+        self,
+        limit: int | None = None,
+        update_timeout: Optional[float] = None,
+        global_timeout: Optional[float] = None,
+    ) -> AsyncGenerator[int, None]:
+        """
+        A generator that yields the return codes (exit codes) of commands executed in the PTY.
+        Checks self.command_outputs_file for new lines (each line is an exit code).
+        """
+        count = 0
+
+        async for _ in _watch_for_file_updates(
+            self.command_outputs_file, update_timeout, global_timeout
+        ):
+            for code in self.read_new_command_results(limit - count if limit else None):
+                yield code
+                count += 1
+                if limit and count >= limit:
+                    return
+
+        # If we end up here due to timeouts:
+        raise CommandTimeoutError()
+
+    def read_new_command_results(self, limit: Optional[int] = None) -> List[int]:
+        """
+        Read new exit codes from the command_outputs_file without blocking.
+        """
+        results = []
+        while True:
+            try:
+                data = self._commands_fd.readline()
+            except ValueError as e:
+                if 'of closed file' in str(e):
+                    raise TerminalDeadError()
+                raise
+            if not data:
+                break
+            data = data.strip()
+            if not data:
+                continue
+            results.append(int(data))
+            if limit and len(results) >= limit:
+                break
+        return results
+
+    async def write(self, s: bytes):
+        """Send input to the PTY session"""
+        if not self.pty_process:
+            raise TerminalDeadError('PTY process is not active.')
+        await self.pty_process.write(s)
+
+    async def terminate(self):
+        """
+        Terminate the PTY session.
+        """
+        with suppress(TerminalDeadError):
+            if self.pty_process:
+                await self.pty_process.stop()
+        self.pty_process = None
+        self._commands_fd.close()
+
+    async def close(self):
+        """
+        Alias for terminate (stop/clean up PTY).
+        """
+        await self.terminate()
+
+    async def wait(self):
+        """
+        Wait for the PTY process to exit.
+        This polls using kill( child_pid, 0 ) to check if the process is still alive.
+        """
+        if not self.pty_process or not self.pty_process.child_pid:
+            return
+        while True:
+            try:
+                os.kill(self.pty_process.child_pid, 0)
+            except OSError:
+                # Process is dead
+                break
+            await asyncio.sleep(0.5)
+
+    async def setwinsize(self, rows: int, cols: int):
+        """
+        Adjust the terminal size in the underlying PTY.
+        """
+        self.dimensions = (rows, cols)
+        if self.pty_process:
+            self.pty_process.resize(rows, cols)
+
+    def getwinsize(self) -> Tuple[int, int]:
+        """
+        Return the stored terminal size.
+        """
+        return self.dimensions
+
+    async def isalive(self):
+        """
+        Check if the PTY child process is still alive by calling os.kill(pid, 0).
+        """
+        if not self.pty_process or not self.pty_process.child_pid:
+            return False
+        try:
+            os.kill(self.pty_process.child_pid, 0)
+            return True
+        except OSError:
+            return False
+
+    async def ctrl_c(self):
+        """
+        Send a Ctrl+C to the PTY session.
+        """
+        await self.write(b'\x03')
+
+    async def kill(self):
+        """
+        Kill the PTY session.
+        """
+        if self.pty_process and self.pty_process.child_pid:
+            try:
+                os.kill(self.pty_process.child_pid, 9)
+            except OSError:
+                pass

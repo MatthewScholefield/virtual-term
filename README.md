@@ -10,14 +10,14 @@ from virtual_term import VirtualTerm
 
 async def main():
     with await VirtualTerm.spawn() as term:
-        term.write("sudo apt-get upgrade\n")
+        term.write(b"sudo apt-get upgrade\n")
         await asyncio.sleep(1)
-        print(term.read_new_output().decode())
+        print((await term.read_new_output()).decode())
 
-        term.write("y\n")  # Respond with 'y' to confirm upgrade
+        term.write(b"y\n")  # Respond with 'y' to confirm upgrade
         result = await term.wait_for_last_command()
 
-        print(result.output)
+        print(result.output.decode())
         assert result.return_code == 0
 
 asyncio.run(main())

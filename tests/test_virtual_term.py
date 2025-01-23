@@ -37,8 +37,8 @@ async def test_spawn_validate_last_command():
 
 @pytest.mark.asyncio
 async def test_run_command(term: VirtualTerm) -> None:
-    result: CommandResult = await term.run_command('echo Hello, World!')
-    assert 'Hello, World!' in result.output
+    result: CommandResult = await term.run_command(b'echo Hello, World! ;')
+    assert b'Hello, World!' in result.output
     assert result.return_code == 0
 
 
@@ -68,17 +68,17 @@ async def test_terminal_alive_status(term: VirtualTerm) -> None:
 @pytest.mark.asyncio
 async def test_command_timeout(term: VirtualTerm) -> None:
     with pytest.raises(CommandTimeoutError):
-        await term.run_command('sleep 5', update_timeout=0.5)
+        await term.run_command(b'sleep 5', update_timeout=0.5)
     await term.ctrl_c()
     result = await term.wait_for_last_command()
     assert result.return_code == 130
-    result: CommandResult = await term.run_command('echo $((11 + 22))')
+    result: CommandResult = await term.run_command(b'echo $((11 + 22))')
     assert result.return_code == 0
-    assert '33' in result.output
+    assert b'33' in result.output
 
 
 @pytest.mark.asyncio
 async def test_terminal_dead_error(term: VirtualTerm) -> None:
     await term.terminate()
     with pytest.raises(TerminalDeadError):
-        await term.run_command('echo This should fail')
+        await term.run_command(b'echo This should fail')
